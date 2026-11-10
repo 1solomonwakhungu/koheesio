@@ -401,25 +401,23 @@ class HttpStep(Step, ExtraParamsMixin):
 
         with _safe_transport_logs():
             try:
-                response = self.session.request(method=_method, **options, stream=stream)
-            except requests.RequestException as error:
-                # Transport exceptions can include server-supplied reason text or headers.
-                error.args = (f"HTTP request failed ({type(error).__name__}).",)
-                raise error from None
-
-            with response:
-                try:
+                with self.session.request(method=_method, **options, stream=stream) as response:
                     response.raise_for_status()
-                except requests.HTTPError as error:
-                    # Keep the exception type and response/request for callers, but omit reflected data.
-                    error.args = (f"HTTP request failed with status code {response.status_code}.",)
-                    raise error from None
-                self.log.debug(f"Received response with status code {response.status_code}")
-
-                try:
-                    yield response
-                finally:
-                    self.log.debug("Request context manager exiting")
+                    self.log.debug(f"Received response with status code {response.status_code}")
+                    try:
+                        yield response
+                    finally:
+                        self.log.debug("Request context manager exiting")
+            except requests.RequestException as error:
+                # Cover dispatch, streamed consumption and response cleanup before
+                # built-in step error handlers can render server-controlled details.
+                if isinstance(error, requests.HTTPError) and error.response is not None:
+                    message = f"HTTP request failed with status code {error.response.status_code}."
+                else:
+                    message = f"HTTP request failed ({type(error).__name__})."
+                # Preserve the exact exception type and raw attributes for callers.
+                error.args = (message,)
+                raise error from None
 
     # noinspection PyMethodOverriding
     def get(self) -> requests.Response:

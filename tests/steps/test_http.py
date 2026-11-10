@@ -331,6 +331,7 @@ def http_security_logs():
                 "HttpPutStep",
                 "HttpDeleteStep",
                 "PaginatedHttpGetStep",
+                "DownloadFileStep",
                 "OktaAccessToken",
             )
         ],
@@ -341,8 +342,10 @@ def http_security_logs():
             super().__init__(logging.DEBUG)
             self.records = []
             self.messages = []
+            self.snapshots = []
 
         def emit(self, record):
+            self.snapshots.append(repr(vars(record)))
             self.records.append(record)
             self.messages.append(self.format(record))
 
@@ -357,7 +360,7 @@ def http_security_logs():
         state.append((logger, logger.level, list(logger.filters)))
         logger.setLevel(logging.DEBUG)
         logger.filters.clear()
-        logger.addHandler(capture)
+        logger.handlers.insert(0, capture)
     try:
         yield capture
     finally:
@@ -702,3 +705,84 @@ def test_transport_logging_nested_requests_restore_outer_context(inner_failure, 
     assert secret not in http_security_logs.text
     assert outside in http_security_logs.text
     assert tuple(logger.filters) == installed_filters
+
+
+@pytest.mark.parametrize("entry", ["buffered", "stream", "download"])
+def test_malformed_chunks_keep_exception_and_first_handler_logs_safe(entry, tmp_path, http_security_logs):
+    import socketserver
+    import threading
+    import traceback
+
+    from requests.exceptions import ChunkedEncodingError
+
+    from koheesio.steps.download_file import DownloadFileStep
+
+    secret = "SYNTHETIC_STREAM_CHUNK_SECRET_7bed"
+    wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    wire += secret.encode() + b"\r\n"
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(8192)
+            self.request.sendall(wire)
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/data.txt"
+        step = (
+            DownloadFileStep(url=url, download_path=tmp_path, max_retries=0)
+            if entry == "download"
+            else HttpGetStep(url=url, max_retries=0)
+        )
+        with pytest.raises(ChunkedEncodingError) as caught:
+            with step:
+                if entry == "stream":
+                    with step._request(stream=True) as response:
+                        list(response.iter_content(32))
+                else:
+                    step.execute()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    error = caught.value
+    assert type(error) is ChunkedEncodingError
+    assert error.__suppress_context__
+    assert secret not in str(error)
+    assert secret not in repr(error)
+    assert secret not in "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert secret not in http_security_logs.text
+    assert all(secret not in snapshot for snapshot in http_security_logs.snapshots)
+    assert any(record.name == step.log.name and record.levelname == "ERROR" for record in http_security_logs.records)
+    assert any(record.name == "urllib3.connectionpool" for record in http_security_logs.records)
+
+
+@responses.activate
+def test_response_close_error_is_sanitized_and_preserves_attributes(http_security_logs, monkeypatch):
+    from requests import Response
+    from requests.exceptions import ConnectionError
+
+    secret = "SYNTHETIC_RESPONSE_CLOSE_SECRET_491b"
+    responses.get(GET_ENDPOINT, body="payload")
+    step = HttpGetStep(url=GET_ENDPOINT)
+    error = ConnectionError(secret)
+
+    def close(response):
+        error.response = response
+        error.request = response.request
+        raise error
+
+    monkeypatch.setattr(Response, "close", close)
+    with pytest.raises(ConnectionError) as caught:
+        with step:
+            with step._request(stream=True) as response:
+                assert response.status_code == 200
+    assert caught.value is error
+    assert error.response is response
+    assert error.request is response.request
+    assert error.__suppress_context__
+    assert secret not in str(error)
+    assert secret not in http_security_logs.text
+    assert all(secret not in snapshot for snapshot in http_security_logs.snapshots)
