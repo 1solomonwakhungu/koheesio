@@ -1,12 +1,18 @@
 import asyncio
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
+import logging
+import socket
+import threading
 import warnings
 
-from aiohttp import ClientResponseError, ClientSession, TCPConnector
+from aiohttp import ClientConnectorError, ClientResponseError, ClientSession, ContentTypeError, TCPConnector
 from aiohttp_retry import ExponentialRetry
 import pytest
 from yarl import URL
 
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from koheesio.asyncio.http import AsyncHttpStep
 from koheesio.steps.http import HttpMethod
@@ -298,3 +304,229 @@ async def test_owned_session_cancelled_during_error_drain(monkeypatch, get_endpo
     monkeypatch.setattr(AsyncHttpStep, "request", original_request)
     step.url = [get_endpoint]
     assert await step.get() == [({"url": str(get_endpoint)}, get_endpoint)]
+
+
+@pytest.fixture
+def header_http_server():
+    """Record synthetic headers at a loopback server without echoing them."""
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append(dict(self.headers))
+            code = 404 if self.path == "/error" or (self.path == "/retry" and len(received) == 1) else 200
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain" if self.path == "/text" else "application/json")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield URL(f"http://127.0.0.1:{server.server_port}"), received
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def capture_async_logs():
+    """Capture full class logger records, independently of pytest's log threshold."""
+
+    @contextmanager
+    def capture(step):
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter("%(name)s %(levelname)s %(message)s"))
+        logger = step.log
+        old_level = logger.level
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+        try:
+            yield stream
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+
+    return capture
+
+
+def test_headers_wire_copy_preserves_secret_values():
+    sentinel = "SYNTHETIC_HEADER_COPY_e042"
+    step = AsyncHttpStep(headers={"Authorization": SecretStr(sentinel), "X-Api-Key": "SYNTHETIC_RAW_KEY_e042"})
+    first = step.get_headers()
+    second = step.get_headers()
+    assert first == second == {"Authorization": sentinel, "X-Api-Key": "SYNTHETIC_RAW_KEY_e042"}
+    assert first is not second
+    assert isinstance(step.headers["Authorization"], SecretStr)
+    assert step.headers["Authorization"].get_secret_value() == sentinel
+    first["Authorization"] = "changed wire copy"
+    assert step.get_headers()["Authorization"] == sentinel
+
+
+def test_empty_headers_wire_copy_is_independent():
+    step = AsyncHttpStep()
+    first = step.get_headers()
+    second = step.get_headers()
+    assert first == second == {}
+    assert first is not second
+    assert first is not step.headers
+    first["X-New"] = "wire-only"
+    assert step.headers == {}
+
+
+@pytest.mark.parametrize("field_name", ["headers", "header"])
+def test_raw_header_values_are_excluded_from_representations(field_name):
+    sentinel = "SYNTHETIC_RAW_KEY_REPR_b8a1"
+    step = AsyncHttpStep(**{field_name: {"X-Api-Key": sentinel}})
+    assert step.get_headers() == {"X-Api-Key": sentinel}
+    assert sentinel not in repr(step)
+    assert sentinel not in step.__repr_str__(" ")
+    assert "headers" not in step.model_dump()
+
+
+def test_header_secrets_survive_repeated_execute(header_http_server, capture_async_logs):
+    endpoint, received = header_http_server
+    sentinel = "SYNTHETIC_HEADER_SUCCESS_203f"
+    raw_key = "SYNTHETIC_RAW_KEY_SUCCESS_203f"
+    step = AsyncHttpStep(urls=[endpoint], headers={"Authorization": SecretStr(sentinel), "X-Api-Key": raw_key})
+    with capture_async_logs(step) as logs:
+        for _ in range(2):
+            assert step.execute().responses_urls == [({}, endpoint)]
+            assert isinstance(step.headers["Authorization"], SecretStr)
+            assert step.headers["Authorization"].get_secret_value() == sentinel
+            assert step.client_session is None
+            assert step.connector is None
+    assert [headers["Authorization"] for headers in received] == [sentinel, sentinel]
+    assert [headers["X-Api-Key"] for headers in received] == [raw_key, raw_key]
+    assert "DEBUG Step Input:" in logs.getvalue()
+    assert "DEBUG Step Output:" in logs.getvalue()
+    assert "Attempt 1 out of" in logs.getvalue()
+    assert sentinel not in logs.getvalue()
+    assert raw_key not in logs.getvalue()
+    assert sentinel not in repr(step)
+
+
+@pytest.mark.parametrize("path, error_class", [("/error", ClientResponseError), ("/text", ContentTypeError)])
+def test_response_error_repr_and_logs_omit_headers(header_http_server, capture_async_logs, path, error_class):
+    endpoint, received = header_http_server
+    sentinel = "SYNTHETIC_HEADER_ERROR_27fa"
+    raw_key = "SYNTHETIC_RAW_ERROR_27fa"
+    step = AsyncHttpStep(
+        urls=[endpoint / path.lstrip("/")],
+        headers={"Authorization": SecretStr(sentinel), "X-Api-Key": raw_key},
+        retry_options=ExponentialRetry(attempts=1),
+    )
+    with capture_async_logs(step) as logs:
+        with pytest.raises(error_class) as raised:
+            step.execute()
+        error = raised.value
+        assert type(error) is error_class
+        assert error.status == (404 if path == "/error" else 200)
+        assert error.request_info.headers["Authorization"] == sentinel
+        assert error.request_info.headers["X-Api-Key"] == raw_key
+        assert error.request_info.url == step.url[0]
+        assert error.args == (error.request_info, error.history)
+        step.log.error("Request failed: %r", error)
+        step.log.error("Request failed: %s", error)
+        for representation in (repr(error), str(error), repr(error.args), repr(step)):
+            assert sentinel not in representation
+            assert raw_key not in representation
+        assert isinstance(step.headers["Authorization"], SecretStr)
+        assert step.headers["Authorization"].get_secret_value() == sentinel
+        assert step.client_session is None
+        assert step.connector is None
+        step.url = [endpoint]
+        assert step.execute().responses_urls == [({}, endpoint)]
+    assert [headers["Authorization"] for headers in received] == [sentinel, sentinel]
+    assert "ERROR Error while running step:" in logs.getvalue()
+    assert "ERROR Request failed:" in logs.getvalue()
+    assert sentinel not in logs.getvalue()
+    assert raw_key not in logs.getvalue()
+
+
+def test_retry_response_error_logs_omit_header_details(header_http_server, capture_async_logs):
+    endpoint, received = header_http_server
+    sentinel = "SYNTHETIC_HEADER_RETRY_f3b5"
+    step = AsyncHttpStep(
+        urls=[endpoint / "retry"],
+        headers={"Authorization": SecretStr(sentinel)},
+        retry_options=ExponentialRetry(attempts=2, start_timeout=0, exceptions={ClientResponseError}),
+    )
+    with capture_async_logs(step) as logs:
+        assert step.execute().responses_urls == [({}, endpoint / "retry")]
+    assert [headers["Authorization"] for headers in received] == [sentinel, sentinel]
+    assert "Attempt 1 out of 2" in logs.getvalue()
+    assert "Attempt 2 out of 2" in logs.getvalue()
+    assert sentinel not in logs.getvalue()
+    assert "retry event" in logs.getvalue()
+    assert isinstance(step.headers["Authorization"], SecretStr)
+
+
+def test_connection_error_logs_omit_headers(capture_async_logs):
+    sentinel = "SYNTHETIC_HEADER_CONNECT_e12a"
+    # Reserving a port without listening makes the failure deterministic.
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        step = AsyncHttpStep(
+            urls=[URL(f"http://127.0.0.1:{sock.getsockname()[1]}")],
+            headers={"Authorization": SecretStr(sentinel)},
+            retry_options=ExponentialRetry(attempts=1),
+        )
+        with capture_async_logs(step) as logs:
+            with pytest.raises(ClientConnectorError):
+                step.execute()
+    assert "ERROR Error while running step:" in logs.getvalue()
+    assert sentinel not in logs.getvalue()
+    assert isinstance(step.headers["Authorization"], SecretStr)
+    assert step.client_session is None
+    assert step.connector is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_secret_request_keeps_headers_and_can_retry(
+    monkeypatch, header_http_server, capture_async_logs
+):
+    endpoint, received = header_http_server
+    sentinel = "SYNTHETIC_HEADER_CANCEL_197c"
+    step = AsyncHttpStep(urls=[endpoint], headers={"Authorization": SecretStr(sentinel)})
+    started = asyncio.Event()
+    resources = []
+    wire_headers = []
+    original_request = AsyncHttpStep.request
+
+    async def blocked_request(self, method, url, **kwargs):
+        resources.extend([self.client_session, self.connector])
+        wire_headers.append(kwargs["headers"])
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(AsyncHttpStep, "request", blocked_request)
+    with capture_async_logs(step) as logs:
+        operation = asyncio.create_task(step.get())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+            assert wire_headers == [{"Authorization": sentinel}]
+            assert all(resource.closed for resource in resources)
+            assert step.client_session is None
+            assert step.connector is None
+            assert isinstance(step.headers["Authorization"], SecretStr)
+            assert sentinel not in repr(step)
+            monkeypatch.setattr(AsyncHttpStep, "request", original_request)
+            assert await step.get() == [({}, endpoint)]
+        finally:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+    assert received[0]["Authorization"] == sentinel
+    assert isinstance(step.headers["Authorization"], SecretStr)
+    assert sentinel not in logs.getvalue()
