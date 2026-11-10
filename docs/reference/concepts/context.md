@@ -157,8 +157,10 @@ context.to_json("path/to/context.json")
 # Load context from a YAML file
 context = Context.from_yaml("path/to/context.yaml")
 
-# Save context to a YAML file
-context.to_yaml("path/to/context.yaml")
+# Save ordinary configuration data to a YAML file
+from pathlib import Path
+
+Path("path/to/context.yaml").write_text(context.to_yaml(), encoding="utf-8")
 
 # Load context from a TOML file
 context = Context.from_toml("path/to/context.toml")
@@ -166,6 +168,23 @@ context = Context.from_toml("path/to/context.toml")
 # Save context to a TOML file
 context.to_toml("path/to/context.toml")
 ```
+
+### YAML loading and compatibility
+
+`Context.from_yaml()` and `BaseModel.from_yaml()` use PyYAML's safe loader. They accept an existing file path
+(`str` or `Path`) or YAML text, and reject Python object tags with `yaml.constructor.ConstructorError` before
+constructing those objects. Nested mappings, lists, and ordinary scalar values remain supported.
+
+The document root must be a mapping. Empty documents, `null`, scalar roots, and sequence roots raise `ValueError`;
+use `{}` for an empty configuration. Earlier versions silently converted parsed non-mapping values into an empty context.
+A nonexistent path is still parsed as YAML text, so a typical missing filename now raises `ValueError` instead
+of returning an empty context.
+
+YAML files that contain Python object tags must be converted to ordinary configuration data before loading.
+The `to_yaml()` export format is unchanged: exports containing Python objects may include tags that `from_yaml()`
+now rejects. Ordinary configuration data still round-trips. `to_json()` and `from_json()` retain their existing
+jsonpickle behavior and trusted-input requirement. Safe YAML loading does not redact secrets from exports;
+`to_yaml(clean=True)` is not a secret-redaction option.
 
 ### Nested Keys
 
