@@ -89,16 +89,14 @@ class OktaAccessToken(Okta):
         """
         Execute an HTTP Post call to Okta service and retrieve the access token.
         """
+        self.output.token = None
         super().execute()
 
         # noinspection PyUnresolvedReferences
         status_code = self.output.status_code
-        # noinspection PyUnresolvedReferences
-        raw_payload = self.output.raw_payload
-
         if status_code != 200:
             raise HTTPError(
-                f"Request failed with '{status_code}' code. Payload: {raw_payload}",
+                f"Okta token request failed with status code {status_code}.",
                 response=self.output.response_raw,
                 request=None,
             )
@@ -106,7 +104,9 @@ class OktaAccessToken(Okta):
         # noinspection PyUnresolvedReferences
         json_payload = self.output.json_payload
 
-        if token := json_payload.get("access_token"):
-            self.output.token = SecretStr(token)
-        else:
-            raise ValueError(f"No 'access_token' found in the Okta response: {json_payload}")
+        if not isinstance(json_payload, dict):
+            raise ValueError("Okta token response must be a JSON object.")
+        token = json_payload.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise ValueError("Okta token response must contain a non-empty string 'access_token'.")
+        self.output.token = SecretStr(token)
