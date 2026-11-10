@@ -186,25 +186,27 @@ class AsyncHttpStep(AsyncStep, ExtraParamsMixin):
             retry_client = self.__retry_client
             return await asyncio.gather(*tasks)
         finally:
-            # gather does not cancel sibling requests when one request fails.
-            # Settle them before releasing resources or allowing another run.
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
             try:
-                if self.client_session is not None:
-                    await self.client_session.close()
-                if retry_client is not None:
-                    await retry_client.close()
+                # gather does not cancel sibling requests when one request fails.
+                # Settle them before releasing resources or allowing another run.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
             finally:
-                if owns_session:
-                    self.client_session = None
-                if owns_connector and self.connector is not None:
-                    try:
-                        await self.connector.close()
-                    finally:
-                        self.connector = None
+                try:
+                    if self.client_session is not None:
+                        await self.client_session.close()
+                    if retry_client is not None:
+                        await retry_client.close()
+                finally:
+                    if owns_session:
+                        self.client_session = None
+                    if owns_connector and self.connector is not None:
+                        try:
+                            await self.connector.close()
+                        finally:
+                            self.connector = None
 
     def _init_session(self) -> None:
         """

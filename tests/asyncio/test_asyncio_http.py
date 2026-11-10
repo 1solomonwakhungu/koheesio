@@ -251,3 +251,50 @@ async def test_supplied_connector_keeps_legacy_close_behavior(get_endpoint: URL)
     assert connector.closed
     assert step.connector is connector
     assert step.client_session is None
+
+
+@pytest.mark.asyncio
+async def test_owned_session_cancelled_during_error_drain(monkeypatch, get_endpoint: URL) -> None:
+    step = AsyncHttpStep(url=[get_endpoint, get_endpoint.with_query(index=1)])
+    started = asyncio.Event()
+    draining = asyncio.Event()
+    resources = []
+    children = []
+    original_request = AsyncHttpStep.request
+
+    async def controlled_request(self, method, url, **kwargs):
+        children.append(asyncio.current_task())
+        if url.query:
+            await started.wait()
+            raise ValueError("synthetic request error")
+        resources.extend([self.client_session, self.connector])
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            draining.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(AsyncHttpStep, "request", controlled_request)
+    operation = asyncio.create_task(step.get())
+    try:
+        await asyncio.wait_for(draining.wait(), timeout=5)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert all(child.done() for child in children)
+        assert all(resource.closed for resource in resources)
+        assert step.client_session is None
+        assert step.connector is None
+    finally:
+        # Release synthetic tasks and resources even if an assertion fails.
+        operation.cancel()
+        for child in children:
+            child.cancel()
+        await asyncio.gather(operation, *children, return_exceptions=True)
+        for resource in resources:
+            await resource.close()
+
+    monkeypatch.setattr(AsyncHttpStep, "request", original_request)
+    step.url = [get_endpoint]
+    assert await step.get() == [({"url": str(get_endpoint)}, get_endpoint)]
