@@ -72,6 +72,11 @@ class DeltaTableReader(Reader):
         startingTimestamp: The timestamp to start from. All table changes committed at or after the timestamp
         (inclusive) will be read by the streaming source. Either provide a timestamp string
         (e.g. 2019-01-01T00:00:00.000Z) or a date string (e.g. 2019-01-01)
+    ending_version : str, optional
+        endingVersion: Inclusive final version for a batch change data feed read.
+    ending_timestamp : str, optional
+        endingTimestamp: Inclusive final timestamp for a batch change data feed read.
+        Provide at most one end bound. When omitted, Delta reads through the latest available version.
     ignore_deletes : bool
         ignoreDeletes: Ignore transactions that delete data at partition boundaries. Note: Only supported for
         streaming tables.
@@ -125,6 +130,17 @@ class DeltaTableReader(Reader):
         "timestamp (inclusive) will be read by the streaming source. "
         "Either provide a timestamp string (e.g. 2019-01-01T00:00:00.000Z) or a date string (e.g. 2019-01-01)"
         + STREAMING_SCHEMA_WARNING,
+    )
+
+    ending_version: Optional[str] = Field(
+        default=None,
+        alias="endingVersion",
+        description="Inclusive final version for batch change data feed reads.",
+    )
+    ending_timestamp: Optional[str] = Field(
+        default=None,
+        alias="endingTimestamp",
+        description="Inclusive final timestamp for batch change data feed reads.",
     )
 
     # Streaming only options
@@ -204,6 +220,16 @@ class DeltaTableReader(Reader):
         return self
 
     @model_validator(mode="after")
+    def _validate_ending_version_and_timestamp(self) -> "DeltaTableReader":
+        """End bounds apply only to batch CDF reads and are mutually exclusive."""
+        if self.ending_version is not None and self.ending_timestamp is not None:
+            raise ValueError("Specify either an 'ending_version' or an 'ending_timestamp', not both.")
+        if self.ending_version is not None or self.ending_timestamp is not None:
+            if self.streaming or not self.read_change_feed:
+                raise ValueError("End bounds require a batch change data feed read.")
+        return self
+
+    @model_validator(mode="after")
     def _validate_ignore_deletes_and_changes_and_skip_commits(self) -> "DeltaTableReader":
         """Validate 'ignore_deletes' and 'ignore_changes' - Only one of each should be provided"""
         ignore_deletes = self.ignore_deletes
@@ -277,7 +303,7 @@ class DeltaTableReader(Reader):
             }
         # Batch only options
         else:
-            pass  # there are none... for now :)
+            options.update(endingVersion=self.ending_version, endingTimestamp=self.ending_timestamp)
 
         def normalize(v: Union[str, bool]) -> str:
             """normalize values"""
