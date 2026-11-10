@@ -26,7 +26,8 @@ def test_project(tmp_path):
     envs = config["tool"]["hatch"]["envs"]
     scripts = envs["default"]["scripts"]
     environment_path = tmp_path / "environment"
-    venv.EnvBuilder(with_pip=False).create(environment_path)
+    # Standalone Python builds may need libraries relative to the real executable.
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(environment_path)
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "test-command-fixture"\nversion = "0.0.0"\n'
         "[tool.hatch.envs.default]\nskip-install = true\n"
