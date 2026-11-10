@@ -78,7 +78,7 @@ We use `pytest` to test our code. You can run the tests by running the following
 make dev-test
 ```
 
-Make sure that all tests pass before submitting a pull request.
+Make sure that all tests pass before submitting a pull request. `make dev-test` and its Spark/non-Spark variants return a nonzero exit status when pytest fails.
 
 ## 🚀 Release Process
 
