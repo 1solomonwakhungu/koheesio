@@ -56,9 +56,9 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-  "cryptography>=42.0.4", # to address CVE-2024-26130
+  "cryptography>=50.0.0", # includes the current cryptography security fixes
   "jsonpickle>2.1.0",
-  "pydantic>=2",
+  "pydantic>=2.4.0", # CVE-2024-3772 / GHSA-mr82-8j83-vxmv
   "python-decouple>=3.8",
   "pytz>=2023.3",
   "pyyaml>=6.0",
@@ -108,7 +108,13 @@ sftp = ["paramiko>=2.6.0"]
 delta = ["delta-spark>=2.2"]
 excel = ["openpyxl>=3.0.0"]
 tableau = ["tableauhyperapi>=0.0.19484", "tableauserverclient>=0.25"]
-snowflake = ["snowflake-connector-python>=3.12.0"]
+# This extra requires Python >=3.11. Keep the connector unconditional so an
+# unsupported Python fails resolution instead of silently omitting Snowflake.
+# See docs/dependency-security.md for patched ranges and the support decision.
+snowflake = [
+  "snowflake-connector-python>=5.1.0,<6",
+  "protobuf>=6.33.5,<7", # GHSA-7gcm-g887-7qv7
+]
 dev = ["ruff", "mypy", "pylint", "colorama", "types-PyYAML", "types-requests"]
 test = [
   "chispa>=0.10.1",
@@ -219,6 +225,7 @@ For lighter / faster testing, use the `dev` environment with `hatch shell dev` a
 the `all-tests` or `spark-tests` command.
 """
 installer = "uv"
+python = "3.12"
 features = [
   "async",
   "async_http",
@@ -290,7 +297,6 @@ features = [
   "pyspark",
   "se",
   "sftp",
-  "snowflake",
   "tableau",
   "test",
 ]
@@ -328,6 +334,11 @@ python = ["3.12"]
 version = ["pyspark352", "pyspark352r"]
 
 [tool.hatch.envs.hatch-test.overrides]
+matrix.python.features = [{ value = "snowflake", if = ["3.11", "3.12"] }]
+matrix.python.env-vars = [
+  # Keep the Python 3.10 Spark matrix without the unsupported native connector.
+  { key = "HATCH_TEST_ARGS", value = " --ignore=tests/snowflake", if = ["3.10"] },
+]
 matrix.version.extra-dependencies = [
   { value = "pyspark>=3.3,<3.4", if = ["pyspark33"] },
   { value = "spark-expectations>=2.1.0", if = ["pyspark33"] },
@@ -364,6 +375,18 @@ name.".*(pyspark35r).*".env-vars = [
   { key = "SPARK_REMOTE", value = "local" },
   { key = "SPARK_TESTING", value = "True" },
 ]
+
+
+# Validate installed core metadata without the optional integrations.
+[tool.hatch.envs.dependency-check]
+features = []
+dependencies = ["pytest", "packaging"]
+
+[[tool.hatch.envs.dependency-check.matrix]]
+python = ["3.9", "3.10", "3.11", "3.12"]
+
+[tool.hatch.envs.dependency-check.scripts]
+run = "pytest -o addopts='' tests/security/test_dependency_metadata.py {args}"
 
 
 [tool.pytest.ini_options]
