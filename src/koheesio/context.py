@@ -263,8 +263,9 @@ class Context(Mapping):
     def from_yaml(cls, yaml_file_or_str: Union[str, Path]) -> Context:
         """Create a Context from a YAML mapping using PyYAML's safe loader.
 
-        Python object tags and other unsupported tags are rejected. The document must
-        have a mapping at its root; nested mappings, lists, and scalar values are supported.
+        Python-object constructors are not enabled. Unsupported tags raise when resolved;
+        tags on discarded merge nodes may be ignored. The document must have a mapping
+        at its root; nested mappings, lists, and scalar values are supported.
 
         Parameters
         ----------
@@ -278,7 +279,7 @@ class Context(Mapping):
         Raises
         ------
         yaml.YAMLError
-            If the YAML is malformed or contains an unsupported tag.
+            If the YAML is malformed or resolves an unsupported tag.
         ValueError
             If the document root is not a mapping, including empty or null documents.
         """

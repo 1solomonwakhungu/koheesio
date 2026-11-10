@@ -172,8 +172,9 @@ context.to_toml("path/to/context.toml")
 ### YAML loading and compatibility
 
 `Context.from_yaml()` and `BaseModel.from_yaml()` use PyYAML's safe loader. They accept an existing file path
-(`str` or `Path`) or YAML text, and reject Python object tags with `yaml.constructor.ConstructorError` before
-constructing those objects. Nested mappings, lists, and ordinary scalar values remain supported.
+(`str` or `Path`) or YAML text. Python-object constructors are not enabled. Unsupported tags that the loader
+resolves raise `yaml.constructor.ConstructorError`; tags on discarded merge nodes may be ignored without
+constructing an object. Nested mappings, lists, and ordinary scalar values remain supported.
 
 The document root must be a mapping. Empty documents, `null`, scalar roots, and sequence roots raise `ValueError`;
 use `{}` for an empty configuration. Earlier versions silently converted parsed non-mapping values into an empty context.
