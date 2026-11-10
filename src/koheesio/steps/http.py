@@ -16,8 +16,11 @@ In the above example, the `response` variable will contain the JSON response fro
 
 from typing import Any, Dict, Generator, List, Optional, Union
 import contextlib
+from contextvars import ContextVar
 from enum import Enum
 import json
+from logging import Filter, LogRecord, getLogger
+from threading import Lock
 
 import requests  # type: ignore[import-untyped]
 from urllib3.util import Retry
@@ -41,6 +44,42 @@ __all__ = [
     "HttpDeleteStep",
     "PaginatedHttpGetStep",
 ]
+
+
+_http_transport_logging: ContextVar[bool] = ContextVar("http_transport_logging", default=False)
+
+
+class _HttpTransportLogFilter(Filter):
+    """Omit urllib3 diagnostic data only within the current HTTP request context."""
+
+    def filter(self, record: LogRecord) -> bool:
+        if _http_transport_logging.get():
+            # urllib3 can log malformed headers/status lines before Requests raises an error.
+            # No response data or discovered secret is needed to protect these records.
+            record.msg = "HTTP transport event; diagnostic details omitted."
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+            record.message = record.msg
+        return True
+
+
+_http_transport_log_filter = _HttpTransportLogFilter()
+_http_transport_filter_lock = Lock()
+
+
+@contextlib.contextmanager
+def _safe_transport_logs() -> Generator[None, None, None]:
+    """Keep library logging safe without changing log levels or unrelated request contexts."""
+    with _http_transport_filter_lock:
+        for name in ("connection", "connectionpool", "poolmanager", "response", "util.retry"):
+            getLogger(f"urllib3.{name}").addFilter(_http_transport_log_filter)
+    token = _http_transport_logging.set(True)
+    try:
+        yield
+    finally:
+        _http_transport_logging.reset(token)
 
 
 class HttpMethod(str, Enum):
@@ -199,12 +238,13 @@ class HttpStep(Step, ExtraParamsMixin):
             default=None,
             alias="response",
             description="The raw requests.Response object returned by the appropriate requests.request() call",
+            repr=False,
         )
         response_json: Optional[Union[Dict, List]] = Field(
-            default=None, alias="json_payload", description="The JSON response for the request"
+            default=None, alias="json_payload", description="The JSON response for the request", repr=False
         )
         raw_payload: Optional[str] = Field(
-            default=None, alias="response_text", description="The raw response for the request"
+            default=None, alias="response_text", description="The raw response for the request", repr=False
         )
         status_code: Optional[int] = Field(default=None, description="The status return code of the request")
 
@@ -212,6 +252,14 @@ class HttpStep(Step, ExtraParamsMixin):
         def json_payload(self) -> Union[dict, list, None]:
             """Alias for response_json"""
             return self.response_json
+
+    def repr_json(self, simple: bool = False) -> str:
+        """Represent the step without response bodies; serialization remains unchanged."""
+        representation = json.loads(super().repr_json(simple=simple))
+        output = representation.get("output", {})
+        for field in ("response_raw", "response_json", "raw_payload"):
+            output.pop(field, None)
+        return json.dumps(representation)
 
     @field_validator("method")
     def get_proper_http_method_from_str_value(cls, method_value: str) -> str:
@@ -269,14 +317,19 @@ class HttpStep(Step, ExtraParamsMixin):
         self.output.response_raw = response
         self.output.raw_payload = response.text
         self.output.status_code = response.status_code
+        self.output.response_json = None
 
         # Only decode non empty payloads to avoid triggering decoding error unnecessarily.
         if self.output.raw_payload:
             try:
-                self.output.response_json = response.json()
-
-            except json.decoder.JSONDecodeError as e:
-                self.log.error(f"An error occurred while processing the JSON payload. Error message:\n{e.msg}")
+                payload = response.json()
+            except (json.decoder.JSONDecodeError, requests.exceptions.JSONDecodeError):
+                self.log.error("Unable to decode the HTTP response as JSON.")
+            else:
+                if payload is None or isinstance(payload, (dict, list)):
+                    self.output.response_json = payload
+                else:
+                    raise ValueError("HTTP JSON response must be an object or array.")
 
     def get_options(self) -> dict:
         """options to be passed to requests.request()"""
@@ -346,14 +399,25 @@ class HttpStep(Step, ExtraParamsMixin):
 
         self._configure_session()
 
-        with self.session.request(method=_method, **options, stream=stream) as response:
-            response.raise_for_status()
-            self.log.debug(f"Received response with status code {response.status_code} and body {response.text}")
-
+        with _safe_transport_logs():
             try:
-                yield response
-            finally:
-                self.log.debug("Request context manager exiting")
+                with self.session.request(method=_method, **options, stream=stream) as response:
+                    response.raise_for_status()
+                    self.log.debug(f"Received response with status code {response.status_code}")
+                    try:
+                        yield response
+                    finally:
+                        self.log.debug("Request context manager exiting")
+            except requests.RequestException as error:
+                # Cover dispatch, streamed consumption and response cleanup before
+                # built-in step error handlers can render server-controlled details.
+                if isinstance(error, requests.HTTPError) and error.response is not None:
+                    message = f"HTTP request failed with status code {error.response.status_code}."
+                else:
+                    message = f"HTTP request failed ({type(error).__name__})."
+                # Preserve the exact exception type and raw attributes for callers.
+                error.args = (message,)
+                raise error from None
 
     # noinspection PyMethodOverriding
     def get(self) -> requests.Response:
