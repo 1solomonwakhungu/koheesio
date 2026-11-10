@@ -6,9 +6,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple, Union
 import asyncio
+from logging import LoggerAdapter
+import re
 import warnings
 
-from aiohttp import BaseConnector, ClientSession, TCPConnector
+from aiohttp import BaseConnector, ClientResponseError, ClientSession, RequestInfo, TCPConnector
 from aiohttp_retry import ExponentialRetry, RetryClient, RetryOptionsBase
 import nest_asyncio  # type: ignore[import-untyped]
 import yarl
@@ -18,6 +20,31 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from koheesio.asyncio import AsyncStep, AsyncStepOutput
 from koheesio.models import ExtraParamsMixin
 from koheesio.steps.http import HttpMethod
+
+
+class _RequestInfoWithRedactedHeaders(RequestInfo):
+    """Keep request metadata accessible without including headers in its repr."""
+
+    def __repr__(self) -> str:
+        return f"RequestInfo(url={self.url!r}, method={self.method!r}, headers=<redacted>, real_url={self.real_url!r})"
+
+
+class _RetryLogger(LoggerAdapter):
+    """Limit third-party retry diagnostics to attempt counts and status codes."""
+
+    def log(self, level: int, msg: Any, *args: Any, **kwargs: Any) -> None:
+        # aiohttp-retry formats exceptions before logging them, including request
+        # headers in ClientResponseError.__repr__. This runs before request() can
+        # replace that representation. Only forward payload-free diagnostics.
+        if (
+            args
+            or not isinstance(msg, str)
+            or not re.fullmatch(r"Attempt [0-9]+ out of [0-9]+|Retrying after response code: [0-9]+", msg)
+        ):
+            msg = "Async HTTP retry event (details omitted)"
+        # Do not forward exception tracebacks, formatting arguments, or extra
+        # context: those may also contain request headers.
+        self.logger.log(level, msg)
 
 
 # noinspection PyUnresolvedReferences
@@ -109,6 +136,7 @@ class AsyncHttpStep(AsyncStep, ExtraParamsMixin):
         description="Request headers",
         alias="header",
         exclude=True,
+        repr=False,
     )
 
     timeout: None = Field(default=None, description="[Optional] Request timeout")
@@ -218,7 +246,10 @@ class AsyncHttpStep(AsyncStep, ExtraParamsMixin):
         # Disable pylint warning: attribute is not initialized in __init__
         # pylint: disable=W0201
         self.__retry_client = RetryClient(
-            client_session=self.client_session, logger=self.log, retry_options=self.retry_options, raise_for_status=True
+            client_session=self.client_session,
+            logger=_RetryLogger(self.log, {}),
+            retry_options=self.retry_options,
+            raise_for_status=True,
         )
 
     @field_validator("timeout")
@@ -239,25 +270,19 @@ class AsyncHttpStep(AsyncStep, ExtraParamsMixin):
         if timeout:
             raise ValueError("timeout is not allowed in AsyncHttpStep. Provide timeout through retry_options.")
 
-    def get_headers(self) -> Union[None, dict]:
+    def get_headers(self) -> Dict[str, str]:
         """
         Get the request headers.
 
         Returns
         -------
-        Optional[Dict[str, Union[str, SecretStr]]]
-            The request headers.
+        Dict[str, str]
+            A fresh plaintext mapping for the request. Stored headers are unchanged.
         """
-        _headers = None
-
-        if self.headers:
-            _headers = {k: v.get_secret_value() if isinstance(v, SecretStr) else v for k, v in self.headers.items()}
-
-            for k, v in self.headers.items():
-                if isinstance(v, SecretStr):
-                    self.headers[k] = v.get_secret_value()
-
-        return _headers or self.headers
+        return {
+            key: value.get_secret_value() if isinstance(value, SecretStr) else value
+            for key, value in self.headers.items()
+        }
 
     # noinspection PyUnusedLocal,PyMethodMayBeStatic
     def set_outputs(self, response) -> None:  # type: ignore[no-untyped-def]
@@ -303,8 +328,15 @@ class AsyncHttpStep(AsyncStep, ExtraParamsMixin):
         Tuple[Dict[str, Any], yarl.URL]
             A tuple containing the response data and the request URL.
         """
-        async with self.__retry_client.request(method=method, url=url, **kwargs) as response:
-            res = await response.json()
+        try:
+            async with self.__retry_client.request(method=method, url=url, **kwargs) as response:
+                res = await response.json()
+        except ClientResponseError as error:
+            # Keep aiohttp's exception type, status and request data available to
+            # callers. Its default repr must not expose the request header map.
+            error.request_info = _RequestInfoWithRedactedHeaders(*error.request_info)
+            error.args = (error.request_info, error.history)
+            raise
 
         return res, response.request_info.url
 
