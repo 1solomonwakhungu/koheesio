@@ -4,8 +4,10 @@ Run these tests without network access. Only authentication, query execution and
 close are replaced; the connector's actual constructor and parameter conversion run.
 """
 
+import gc
 import sys
 from unittest.mock import MagicMock
+import weakref
 
 import pytest
 
@@ -35,7 +37,9 @@ def connection_boundary(monkeypatch, tmp_path):
         opened.append(connection)
 
     def close(connection, *args, **kwargs):
-        closed.append(connection)
+        # A prior test's delayed finalizer can reach this class-wide replacement.
+        if any(connection is current for current in opened):
+            closed.append(connection)
 
     def execute(connection, sql):
         executed.append(sql)
@@ -125,3 +129,21 @@ def test_installed_connector_closes_when_query_raises(connection_boundary, monke
     assert raised.value is error
     assert raised.value.errno == 1003
     assert closed == opened
+
+
+def test_close_tracking_ignores_delayed_finalizers_from_other_connections(connection_boundary):
+    connection_class, opened, closed, _, _ = connection_boundary
+    previous = object.__new__(connection_class)
+    previous.auto_cleanup = True
+    previous.is_closed = lambda: False
+    previous.cycle = previous
+    previous_ref = weakref.ref(previous)
+    del previous
+
+    gc.collect()
+
+    assert previous_ref() is None
+    assert closed == []
+    with step().conn as connection:
+        assert opened == [connection]
+    assert closed == [connection]
