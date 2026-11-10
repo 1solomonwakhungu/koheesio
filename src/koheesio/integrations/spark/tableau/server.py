@@ -2,7 +2,10 @@ from typing import Any, ContextManager, Optional, Union
 from enum import Enum
 import os
 from pathlib import PurePath
+from urllib.parse import urlsplit
 
+from requests import PreparedRequest, Response, Session
+from requests.exceptions import RequestException, TooManyRedirects
 from tableauserverclient import (
     DatasourceItem,
     PersonalAccessTokenAuth,
@@ -11,12 +14,34 @@ from tableauserverclient import (
 )
 from tableauserverclient.server.pager import Pager
 from tableauserverclient.server.server import Server
-import urllib3  # type: ignore
 
-from pydantic import Field, SecretStr
+from pydantic import Field, FilePath, SecretStr, field_validator
 
 from koheesio.models import model_validator
 from koheesio.steps import Step, StepOutput
+
+
+class _TableauSession(Session):
+    """Keep TSC requests on verified HTTPS and stop redirects before TSC can replay credentials."""
+
+    def send(self, request: PreparedRequest, **kwargs: Any) -> Response:
+        if urlsplit(request.url or "").scheme != "https":
+            raise ValueError("Tableau requests require HTTPS.")
+        if not kwargs.get("verify", self.verify):
+            raise ValueError("Tableau TLS certificate verification cannot be disabled.")
+        kwargs["allow_redirects"] = False
+        try:
+            response = super().send(request, **kwargs)
+        except RequestException as error:
+            # TSC logs transport exception text. Do not expose request bodies, headers,
+            # proxy credentials or arbitrary text supplied by a transport adapter.
+            raise type(error)("Tableau HTTPS transport failed; check certificate trust and connectivity.") from None
+        if 300 <= response.status_code < 400:
+            response.close()
+            # TSC has its own redirect follower in addition to Requests'. Raising here
+            # prevents either implementation from forwarding passwords or session tokens.
+            raise TooManyRedirects("Tableau redirects are disabled; configure the final HTTPS URL.")
+        return response
 
 
 class TableauServer(Step):
@@ -27,9 +52,14 @@ class TableauServer(Step):
     url: str = Field(
         default=...,
         alias="url",
-        description="Hostname for the Tableau server, e.g. tableau.my-org.com",
-        examples=["tableau.my-org.com"],
+        description="HTTPS URL for the Tableau server, without credentials, query, or fragment",
+        examples=["https://tableau.my-org.com"],
     )
+    ca_bundle: Optional[FilePath] = Field(
+        default=None,
+        description="Optional PEM CA bundle file. TLS certificate verification is always enabled.",
+    )
+    server: Optional[Server] = Field(default=None, exclude=True, repr=False)
     user: str = Field(default=..., alias="user", description="Login name for the Tableau user")
     password: SecretStr = Field(default=..., alias="password", description="Password for the Tableau user")
     site_id: str = Field(
@@ -68,9 +98,23 @@ class TableauServer(Step):
         description="ID of the project on the Tableau server",
     )
 
-    def __init__(self, **data: Any) -> None:
-        super().__init__(**data)
-        self.server: Optional[Server] = None
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or any(character.isspace() for character in value)
+        ):
+            raise ValueError("Tableau requires an HTTPS URL without credentials, query, or fragment.")
+        # Reject invalid ports before constructing a client or unwrapping credentials.
+        _ = parsed.port
+        return parsed.geturl().rstrip("/")
 
     @model_validator(mode="after")
     def validate_project(self) -> "TableauServer":
@@ -100,9 +144,8 @@ class TableauServer(Step):
         -------
         ContextManager for TableauAuth or PersonalAccessTokenAuth authorization object
         """
-        # Suppress 'InsecureRequestWarning'
-        # noinspection PyUnresolvedReferences
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        # Assignment validation is disabled on Step, so recheck mutable URL configuration.
+        url = self.validate_url(self.url)
 
         tableau_auth: Union[TableauAuth, PersonalAccessTokenAuth]
         tableau_auth = TableauAuth(username=self.user, password=self.password.get_secret_value(), site_id=self.site_id)
@@ -112,12 +155,14 @@ class TableauServer(Step):
                 "Token details provided, this will take precedence over username and password authentication."
             )
             tableau_auth = PersonalAccessTokenAuth(
-                token_name=self.token_name, personal_access_token=self.token_value, site_id=self.site_id
+                token_name=self.token_name,
+                personal_access_token=self.token_value.get_secret_value(),
+                site_id=self.site_id,
             )
 
-        self.server = Server(self.url)
+        self.server = Server(url, session_factory=_TableauSession)
         self.server.version = self.version
-        self.server.add_http_options({"verify": False})
+        self.server.add_http_options({"verify": str(self.ca_bundle) if self.ca_bundle else True})
 
         return self.server.auth.sign_in(tableau_auth)
 
