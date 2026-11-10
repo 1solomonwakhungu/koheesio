@@ -1,0 +1,66 @@
+{
+  "actions/checkout": {
+    "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "reviewed_ref": "v7",
+    "ref_api": "https://api.github.com/repos/actions/checkout/git/ref/tags/v7",
+    "action_path": "action.yml",
+    "action_blob_sha": "5b0524f730db83f9513c18ab31a6c086c7239076",
+    "action_url": "https://github.com/actions/checkout/blob/3d3c42e5aac5ba805825da76410c181273ba90b1/action.yml"
+  },
+  "actions/setup-python": {
+    "sha": "6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
+    "reviewed_ref": "v7",
+    "ref_api": "https://api.github.com/repos/actions/setup-python/git/ref/tags/v7",
+    "action_path": "action.yml",
+    "action_blob_sha": "645de4f5108b28bcc7ed043ee171770b0754cc35",
+    "action_url": "https://github.com/actions/setup-python/blob/6d4fd22b20465ccc0f7354476588e8df7c9ca0e0/action.yml"
+  },
+  "pypa/hatch": {
+    "sha": "f647ed70d49adb885f53a27d1c7f5bdaeacf2c60",
+    "reviewed_ref": "install",
+    "ref_api": "https://api.github.com/repos/pypa/hatch/git/ref/heads/install",
+    "action_path": "action.yml",
+    "action_blob_sha": "8944bf99491cedc83c2f12c2c1c29e9f9b9e630d",
+    "action_url": "https://github.com/pypa/hatch/blob/f647ed70d49adb885f53a27d1c7f5bdaeacf2c60/action.yml"
+  },
+  "github/codeql-action/init": {
+    "sha": "33d7b85da1a04171e211befe2c739303b9a4c066",
+    "reviewed_ref": "v4",
+    "ref_api": "https://api.github.com/repos/github/codeql-action/git/ref/tags/v4",
+    "action_path": "init/action.yml",
+    "action_blob_sha": "b6721a8c7b62f6500c0af9c8959aea5f2db09ee6",
+    "action_url": "https://github.com/github/codeql-action/blob/33d7b85da1a04171e211befe2c739303b9a4c066/init/action.yml"
+  },
+  "github/codeql-action/analyze": {
+    "sha": "33d7b85da1a04171e211befe2c739303b9a4c066",
+    "reviewed_ref": "v4",
+    "ref_api": "https://api.github.com/repos/github/codeql-action/git/ref/tags/v4",
+    "action_path": "analyze/action.yml",
+    "action_blob_sha": "d70401c0a48ad4246c1ef34787e79f5cad4d8281",
+    "action_url": "https://github.com/github/codeql-action/blob/33d7b85da1a04171e211befe2c739303b9a4c066/analyze/action.yml"
+  },
+  "actions/upload-artifact": {
+    "sha": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+    "reviewed_ref": "v7",
+    "ref_api": "https://api.github.com/repos/actions/upload-artifact/git/ref/tags/v7",
+    "action_path": "action.yml",
+    "action_blob_sha": "7cb4d1e81db55320b41217e1a78a1a46e3d2baef",
+    "action_url": "https://github.com/actions/upload-artifact/blob/cf430e030ddbb5b0abf93d22962f4752f3646cd9/action.yml"
+  },
+  "actions/download-artifact": {
+    "sha": "9000827ccba6bdab643e8b6fd33ac0654aef8333",
+    "reviewed_ref": "v8",
+    "ref_api": "https://api.github.com/repos/actions/download-artifact/git/ref/tags/v8",
+    "action_path": "action.yml",
+    "action_blob_sha": "8b8c65029ccad20750a29fecb438eca5a607fc57",
+    "action_url": "https://github.com/actions/download-artifact/blob/9000827ccba6bdab643e8b6fd33ac0654aef8333/action.yml"
+  },
+  "pypa/gh-action-pypi-publish": {
+    "sha": "7245906fb61fa33a13554f9d5fb856fe61758086",
+    "reviewed_ref": "release/v1",
+    "ref_api": "https://api.github.com/repos/pypa/gh-action-pypi-publish/git/ref/heads/release/v1",
+    "action_path": "action.yml",
+    "action_blob_sha": "f0b2c5066dd5e752990bc69b0109e84563bc8db1",
+    "action_url": "https://github.com/pypa/gh-action-pypi-publish/blob/7245906fb61fa33a13554f9d5fb856fe61758086/action.yml"
+  }
+}

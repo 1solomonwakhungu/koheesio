@@ -1,88 +1,77 @@
-name: Release 
+name: Release
 
 on:
   push:
     tags:
-    - koheesio-v*
+      - koheesio-v*
     branches:
-    - main
+      - main
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  group: release-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
   run:
     shell: bash
 
-env:
-  APP_NAME: koheesio
-  PYTHON_VERSION: "3.12"
-  PYOXIDIZER_VERSION: "0.24.0"
-  DIST_URL: "https://github.com/Nike-Inc/koheesio/releases"
-
 jobs:
+  tests:
+    # Forks must not enter the release path, including main-branch pushes.
+    if: github.repository == 'Nike-Inc/koheesio'
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
   python-artifacts:
     name: Build wheel and source distribution
+    if: github.repository == 'Nike-Inc/koheesio'
+    needs: tests
     runs-on: ubuntu-latest
-
-    outputs:
-      old-version: ${{ steps.version.outputs.old-version }}
-      version: ${{ steps.version.outputs.version }}
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v7
-      with:
-        fetch-depth: 0
+      - name: Checkout tested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - name: Install Hatch
+        uses: pypa/hatch@f647ed70d49adb885f53a27d1c7f5bdaeacf2c60 # install
+      - name: Build
+        run: hatch build
+      - name: Upload artifacts
+        if: github.repository == 'Nike-Inc/koheesio'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: python-artifacts-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
 
-    - name: Set up Python ${{ env.PYTHON_VERSION }}
-      uses: actions/setup-python@v7
-      with:
-        python-version: ${{ env.PYTHON_VERSION }}
-
-    - name: Install Hatch
-      uses: pypa/hatch@install
-
-    # Windows installers don't accept non-integer versions so we ubiquitously
-    # perform the following transformation: X.Y.Z.devN -> X.Y.Z.N
-    - name: Set project version
-      id: version
-      run: |-
-        old_version="$(hatch version)"
-        version="${old_version/dev/}"
-
-        echo "old-version=$old_version" >> $GITHUB_OUTPUT
-        echo "version=$version" >> $GITHUB_OUTPUT
-        echo "$version"
-        
-    - name: Build
-      run: hatch build
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v7
-      with:
-        name: python-artifacts
-        path: dist/*
-        if-no-files-found: error
-  
   publish-pypi:
     name: Publish to PyPI
-    needs: python-artifacts
-    if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+    needs:
+      - tests
+      - python-artifacts
+    if: >-
+      github.repository == 'Nike-Inc/koheesio' &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/koheesio-v')
     runs-on: ubuntu-latest
-    # Specifying a GitHub environment is optional, but strongly encouraged
     environment: release
     permissions:
-      # IMPORTANT: this permission is mandatory for trusted publishing
       id-token: write
-
     steps:
-      - name: Download Python artifacts
-        uses: actions/download-artifact@v8
+      - name: Download tested Python artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: python-artifacts
+          name: python-artifacts-${{ github.sha }}
           path: dist
-  
       - name: Publish package distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
