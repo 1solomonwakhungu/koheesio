@@ -141,3 +141,28 @@ Please note that this is not an exhaustive list. Koheesio provides many more `Re
 data sources. For a complete list, please refer to the Koheesio documentation or the source code.
 
 More readers can be found in the `koheesio/steps/readers` module.
+
+
+## Bounded Delta change data feed reads
+
+Use an end bound to read a fixed interval of retained changes in batch mode:
+
+```python
+from koheesio.spark.readers.delta import DeltaTableReader
+
+changes = DeltaTableReader(
+    table="sales.events",
+    read_change_feed=True,
+    starting_version="40",
+    ending_version="45",
+).read()
+```
+
+Both boundaries are inclusive. Use `ending_timestamp` instead of `ending_version`
+for a timestamp boundary; the aliases `endingVersion` and `endingTimestamp` also
+work. Supply at most one end bound, only with batch CDF reads. Omitting it preserves
+Delta's existing behavior of reading through the latest available version.
+
+Delta validates boundary ordering, timestamp syntax and retained history. An end
+bound does not preserve expired CDF records or guarantee a historical schema; the
+usual Delta CDF retention and schema compatibility restrictions still apply.
