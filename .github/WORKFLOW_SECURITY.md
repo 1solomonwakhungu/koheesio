@@ -16,3 +16,9 @@ actionlint .github/workflows/*.yml
 ```
 
 The policy tests parse the checked-in workflows, evaluate the supported guard expressions over fork/upstream event scenarios, execute the final-check shell for every prerequisite outcome, and check permissions, action identities, and the release dependency graph. These are local source checks. They do not establish hosted runner behavior, a passing Python/Spark matrix, release-environment approvals, organization Actions policy, or PyPI trusted-publisher configuration. Those controls and a hosted release remain unverified until separately authorized and observed. No private upstream security-reporting channel is documented here.
+
+The Spark matrix selects the runner image's preinstalled JDK 17 through
+`JAVA_HOME_17_X64` before running Hatch. Spark 3.3–3.5 does not support the
+Ubuntu 26.04 image's default JDK 25. Selection fails if JDK 17 is unavailable;
+no Java package cache or publisher is enabled. Policy tests retain all ten
+Python/Spark pairs and reject known upload actions added to other workflows.

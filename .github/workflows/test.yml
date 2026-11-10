@@ -76,6 +76,13 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Select JDK 17 for Spark
+        id: spark-java
+        run: |
+          test -x "${JAVA_HOME_17_X64:?JDK 17 is required}/bin/java"
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+          "$JAVA_HOME_17_X64/bin/java" -version
       - name: Install Hatch
         uses: pypa/hatch@f647ed70d49adb885f53a27d1c7f5bdaeacf2c60 # install
       - name: Run tests

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -97,6 +98,54 @@ class WorkflowPolicy(unittest.TestCase):
                     with self.subTest(workflow=name, job=job_id, repository=repository, event=event, ref=ref):
                         self.assertFalse(runnable(job, repository, event, ref, outcomes))
 
+    def test_upload_actions_in_every_workflow_reject_forks(self):
+        upload_actions = {
+            "actions/upload-artifact", "actions/cache", "actions/cache/save",
+            "github/codeql-action/init", "github/codeql-action/analyze",
+            "github/codeql-action/upload-sarif", "pypa/gh-action-pypi-publish",
+        }
+        for name, workflow in self.workflows.items():
+            for job_id, job in workflow["jobs"].items():
+                outcomes = {need: "success" for need in dependencies(job)}
+                for step in job.get("steps", []):
+                    if step.get("uses", "").split("@", 1)[0] not in upload_actions:
+                        continue
+                    for repository, (event, ref) in itertools.product(FORKS, EVENTS):
+                        with self.subTest(workflow=name, job=job_id, action=step["uses"], repository=repository):
+                            self.assertFalse(
+                                runnable(job, repository, event, ref, outcomes)
+                                and expression_matches(step.get("if", "true"), repository, event, ref)
+                            )
+
+    def test_spark_java_selection_precedes_tests_and_fails_without_jdk(self):
+        steps = self.workflows["test.yml"]["jobs"]["tests"]["steps"]
+        index = next(i for i, step in enumerate(steps) if step.get("id") == "spark-java")
+        test_index = next(i for i, step in enumerate(steps) if step.get("name") == "Run tests")
+        self.assertLess(index, test_index)
+        script = steps[index]["run"]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            java_home = directory / "jdk17"
+            (java_home / "bin").mkdir(parents=True)
+            java = java_home / "bin/java"
+            java.write_text("#!/bin/sh\nexit 0\n")
+            java.chmod(0o700)
+            for available in (True, False):
+                env_file = directory / (str(available) + ".env")
+                path_file = directory / (str(available) + ".path")
+                environment = {"PATH": "/usr/bin:/bin", "GITHUB_ENV": str(env_file), "GITHUB_PATH": str(path_file)}
+                if available:
+                    environment["JAVA_HOME_17_X64"] = str(java_home)
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                                        env=environment, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, available)
+                if available:
+                    self.assertEqual(env_file.read_text(), f"JAVA_HOME={java_home}\n")
+                    self.assertEqual(path_file.read_text(), f"{java_home}/bin\n")
+                else:
+                    self.assertFalse(env_file.exists())
+                    self.assertFalse(path_file.exists())
+
     def test_upstream_publisher_requires_release_tag_and_successful_tests_and_build(self):
         job = self.workflows["release.yml"]["jobs"]["publish-pypi"]
         self.assertEqual(set(dependencies(job)), {"tests", "python-artifacts"})
@@ -154,6 +203,17 @@ class WorkflowPolicy(unittest.TestCase):
             for event, ref in EVENTS:
                 self.assertTrue(runnable(job, FORKS[0], event, ref))
         self.assertEqual(workflow["jobs"]["tests"]["strategy"]["fail-fast"], "false")
+        matrix = workflow["jobs"]["tests"]["strategy"]["matrix"]
+        self.assertNotIn("include", matrix)
+        actual = set(itertools.product(matrix["python-version"], matrix["pyspark-version"]))
+        for excluded in matrix.get("exclude", []):
+            actual.discard((excluded["python-version"], excluded["pyspark-version"]))
+        expected = {(python, spark) for python, versions in {
+            "3.10": ("33", "34", "35", "35r"),
+            "3.11": ("35", "35r"),
+            "3.12": ("35", "35r", "352", "352r"),
+        }.items() for spark in versions}
+        self.assertEqual(actual, expected)
 
     def test_required_final_check_fails_for_every_unsuccessful_prerequisite(self):
         job = self.workflows["test.yml"]["jobs"]["final_check"]
