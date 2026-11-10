@@ -18,7 +18,9 @@ import hashlib
 from pathlib import Path
 import time
 
+from paramiko.hostkeys import HostKeys
 from paramiko.sftp_client import SFTPClient
+from paramiko.ssh_exception import SSHException
 from paramiko.transport import Transport
 
 from pydantic import PrivateAttr
@@ -118,6 +120,10 @@ class SFTPWriter(Writer):
         SFTP Server Username
     password : SecretStr, optional, default=None
         SFTP Server Password
+    known_hosts : Optional[Path], optional, default=None
+        Explicit OpenSSH known_hosts file containing trusted server public keys. Required when connecting.
+        No user or system trust files are loaded automatically. Port 22 uses the host name; other ports use
+        [host]:port. Obtain keys through a trusted channel before configuring this file.
     buffer_writer : BufferWriter
         This is the writer that will generate the body of the file that will be written to the specified
         file through SFTP. Details on how the DataFrame is written to the buffer should be implemented in the
@@ -139,6 +145,11 @@ class SFTPWriter(Writer):
     port: int = Field(default=..., description="SFTP Port")
     username: Optional[SecretStr] = Field(default=None, description="SFTP Server Username")
     password: Optional[SecretStr] = Field(default=None, description="SFTP Server Password")
+
+    known_hosts: Optional[Path] = Field(
+        default=None,
+        description="Explicit trusted OpenSSH known_hosts file. Required before connecting; no automatic discovery.",
+    )
 
     buffer_writer: InstanceOf[BufferWriter] = Field(
         default=...,
@@ -201,37 +212,52 @@ class SFTPWriter(Writer):
 
     @property
     def transport(self) -> Transport:
-        """Return the transport for the SFTP connection. If it doesn't exist, create it.
+        """Connect only after loading explicit trust, and verify the host key before authentication."""
+        if self._transport is None:
+            if self.known_hosts is None:
+                raise ValueError("known_hosts must name an explicit trusted host-key file before connecting")
+            host_keys = HostKeys()
+            host_keys.load(str(self.known_hosts))
+            identity = self.host if self.port == 22 else f"[{self.host}]:{self.port}"
+            if not host_keys.lookup(identity):
+                raise SSHException("SFTP server has no trusted key in the configured known_hosts file")
 
-        If the username and password are provided, use them to connect to the SFTP server.
-        """
-        if not self._transport:
-            self._transport = Transport((self.host, self.port))
-            if self.username and self.password:
-                self._transport.connect(
-                    username=self.username.get_secret_value(), password=self.password.get_secret_value()
-                )
-            else:
-                self._transport.connect()
+            transport = Transport((self.host, self.port))
+            try:
+                transport.start_client()
+                if not host_keys.check(identity, transport.get_remote_server_key()):
+                    raise SSHException("SFTP server host key does not match the configured known_hosts file")
+                if self.username and self.password:
+                    transport.auth_password(
+                        username=self.username.get_secret_value(), password=self.password.get_secret_value()
+                    )
+            except BaseException:
+                transport.close()
+                raise
+            self._transport = transport
         return self._transport
 
     @property
     def client(self) -> SFTPClient:
-        """Return the SFTP client. If it doesn't exist, create it."""
-        if not self._client:
+        """Return the SFTP client, closing the transport if channel setup fails."""
+        if self._client is None:
             try:
                 self._client = SFTPClient.from_transport(self.transport)
-            except EOFError as e:
-                self.log.error(f"Failed to create SFTP client. Transport active: {self.transport.is_active()}")
-                raise e
+            except BaseException:
+                self._close_client()
+                raise
         return self._client
 
     def _close_client(self) -> None:
-        """Close the SFTP client and transport."""
-        if self.client:
-            self.client.close()
-        if self.transport:
-            self.transport.close()
+        """Close existing resources without opening a connection during cleanup."""
+        client, transport = self._client, self._transport
+        self._client = self._transport = None
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            if transport is not None:
+                transport.close()
 
     def write_file(self, file_path: str, buffer_output: InstanceOf[BufferWriter.Output]) -> None:
         """
@@ -295,10 +321,8 @@ class SFTPWriter(Writer):
         self.write_file(file_path, buffer_output)
 
     def execute(self) -> Writer.Output:
-        buffer_output: InstanceOf[BufferWriter.Output] = self.buffer_writer.write(self.df)
-
-        # write buffer to the SFTP server
         try:
+            buffer_output: InstanceOf[BufferWriter.Output] = self.buffer_writer.write(self.df)
             self._handle_write_mode(self.path.as_posix(), buffer_output)
         finally:
             self._close_client()
@@ -322,6 +346,7 @@ class SendCsvToSftp(PandasCsvBufferWriter, SFTPWriter):
         port=22,
         username="user",
         password="password",
+        known_hosts="/etc/pipeline/sftp_known_hosts",
         path="/path/to/folder",
         file_name="file.tsv.gz",
         # CSV Parameters
@@ -409,6 +434,7 @@ class SendJsonToSftp(PandasJsonBufferWriter, SFTPWriter):
         port=22,
         username="user",
         password="password",
+        known_hosts="/etc/pipeline/sftp_known_hosts",
         path="/path/to/folder",
         file_name="file.json.gz",
         # JSON Parameters (Inherited from PandasJsonBufferWriter)
