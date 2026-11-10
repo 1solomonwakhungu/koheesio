@@ -440,7 +440,8 @@ class PaginatedHttpGetStep(HttpGetStep):
     paginate : bool, optional
         Whether to paginate the API response. Defaults to False.
     pages : int, optional
-        Number of pages to paginate. Defaults to 1.
+        Number of pages to fetch, starting at offset. For example, pages=2 and offset=3 fetch pages 3 and 4.
+        Defaults to 1.
     offset : int, optional
         Offset for paginated API calls. Offset determines the starting page. Defaults to 1.
     limit : int, optional
@@ -453,7 +454,7 @@ class PaginatedHttpGetStep(HttpGetStep):
         "be paginated. The url should contain a named 'page' parameter for example: "
         "api.example.com/data?page={page}",
     )
-    pages: Optional[int] = Field(default=1, description="Number of pages to paginate. Defaults to 1")
+    pages: Optional[int] = Field(default=1, description="Number of pages to fetch, starting at offset. Defaults to 1")
     offset: Optional[int] = Field(
         default=1,
         description="Offset for paginated API calls. Offset determines the starting page. Defaults to 1. "
@@ -535,23 +536,25 @@ class PaginatedHttpGetStep(HttpGetStep):
             The output of the HTTP GET request.
         """
         # Set up pagination parameters
-        offset, pages = (self.offset, self.pages + 1) if self.paginate else (1, 1)  # type: ignore
+        offset, pages = (self.offset, self.pages) if self.paginate else (1, 1)
         data = []
         _basic_url = self.url
 
-        for page in range(offset, pages):  # type: ignore[arg-type]
-            if self.paginate:
-                self.log.info(f"Fetching page {page} of {pages - 1}")
+        try:
+            for page_number, page in enumerate(range(offset, offset + pages), start=1):  # type: ignore[arg-type, operator]
+                if self.paginate:
+                    self.log.info(f"Fetching page {page} ({page_number} of {pages})")
 
-            self.url = self._url(basic_url=_basic_url, page=page)
+                self.url = self._url(basic_url=_basic_url, page=page)
 
-            with self._request() as response:
-                if isinstance(response_json := response.json(), list):
-                    data += response_json
-                else:
-                    data.append(response_json)
+                with self._request() as response:
+                    if isinstance(response_json := response.json(), list):
+                        data += response_json
+                    else:
+                        data.append(response_json)
+        finally:
+            self.url = _basic_url
 
-        self.url = _basic_url
         self.output.response_json = data
         self.output.response_raw = None
         self.output.raw_payload = None
