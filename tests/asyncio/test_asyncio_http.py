@@ -1,3 +1,4 @@
+import asyncio
 import warnings
 
 from aiohttp import ClientResponseError, ClientSession, TCPConnector
@@ -149,3 +150,104 @@ async def test_async_http_step_get_options_warning(get_endpoint: URL) -> None:
         assert len(w) == 1
         assert issubclass(w[-1].category, UserWarning)
         assert "get_options is not implemented in AsyncHttpStep." == str(w[-1].message)
+
+
+@pytest.mark.asyncio
+async def test_owned_session_repeated_get(get_endpoint: URL) -> None:
+    step = AsyncHttpStep(url=[get_endpoint])
+    first = await step.get()
+    second = await step.get()
+    assert first == second == [({"url": str(get_endpoint)}, get_endpoint)]
+    assert step.client_session is None
+    assert step.connector is None
+
+
+def test_owned_session_repeated_execute(get_endpoint: URL) -> None:
+    step = AsyncHttpStep(url=[get_endpoint])
+    first = step.execute().responses_urls
+    second = step.execute().responses_urls
+    assert first == second == [({"url": str(get_endpoint)}, get_endpoint)]
+    assert step.client_session is None
+    assert step.connector is None
+
+
+@pytest.mark.asyncio
+async def test_owned_session_error_then_retry(status_404_endpoint: URL, get_endpoint: URL) -> None:
+    step = AsyncHttpStep(url=[status_404_endpoint], retry_options=ExponentialRetry(attempts=1))
+    with pytest.raises(ClientResponseError):
+        await step.get()
+    step.url = [get_endpoint]
+    assert await step.get() == [({"url": str(get_endpoint)}, get_endpoint)]
+    assert step.client_session is None
+    assert step.connector is None
+
+
+@pytest.mark.asyncio
+async def test_owned_session_empty_then_get(get_endpoint: URL) -> None:
+    step = AsyncHttpStep(url=[])
+    assert await step.get() == []
+    step.url = [get_endpoint]
+    assert await step.get() == [({"url": str(get_endpoint)}, get_endpoint)]
+    assert step.client_session is None
+    assert step.connector is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["cancel", "request_error"])
+async def test_owned_session_drains_tasks_and_can_retry(monkeypatch, get_endpoint: URL, failure: str) -> None:
+    step = AsyncHttpStep(url=[get_endpoint, get_endpoint.with_query(index=1)])
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    resources = []
+    original_request = AsyncHttpStep.request
+
+    async def controlled_request(self, method, url, **kwargs):
+        if url.query:
+            await started.wait()
+            if failure == "request_error":
+                raise ValueError("synthetic request error")
+            await asyncio.Event().wait()
+        resources.extend([self.client_session, self.connector])
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(AsyncHttpStep, "request", controlled_request)
+    operation = asyncio.create_task(step.get())
+    await asyncio.wait_for(started.wait(), timeout=5)
+    if failure == "cancel":
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+    else:
+        with pytest.raises(ValueError, match="synthetic request error"):
+            await operation
+    assert finished.is_set()
+    assert all(resource.closed for resource in resources)
+    assert step.client_session is None
+    assert step.connector is None
+    monkeypatch.setattr(AsyncHttpStep, "request", original_request)
+    step.url = [get_endpoint]
+    assert await step.get() == [({"url": str(get_endpoint)}, get_endpoint)]
+
+
+@pytest.mark.asyncio
+async def test_supplied_session_keeps_legacy_close_behavior(get_endpoint: URL) -> None:
+    session = ClientSession()
+    step = AsyncHttpStep(client_session=session, url=[get_endpoint])
+    assert await step.get() == [({"url": str(get_endpoint)}, get_endpoint)]
+    assert session.closed
+    assert step.client_session is session
+    assert step.connector is None
+
+
+@pytest.mark.asyncio
+async def test_supplied_connector_keeps_legacy_close_behavior(get_endpoint: URL) -> None:
+    connector = TCPConnector(limit=2)
+    step = AsyncHttpStep(connector=connector, url=[get_endpoint])
+    assert await step.get() == [({"url": str(get_endpoint)}, get_endpoint)]
+    assert connector.closed
+    assert step.connector is connector
+    assert step.client_session is None

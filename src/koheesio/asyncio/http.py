@@ -25,6 +25,12 @@ class AsyncHttpStep(AsyncStep, ExtraParamsMixin):
     """
     Asynchronous HTTP step for making HTTP requests using aiohttp.
 
+    Internally created sessions and connectors are released after each run, so the
+    step can be executed sequentially again. Caller-supplied resources retain the
+    existing close-on-completion behavior and are not recreated automatically;
+    replace closed supplied resources before another run. Concurrent executions
+    on the same step instance are not supported.
+
     Parameters
     ----------
     client_session : Optional[ClientSession]
@@ -172,15 +178,33 @@ class AsyncHttpStep(AsyncStep, ExtraParamsMixin):
         List[Tuple[Dict[str, Any], yarl.URL]]
             A list of response data and corresponding request URLs.
         """
-        self._init_session()
+        owns_session = self.client_session is None
+        owns_connector = self.connector is None
+        retry_client = None
         try:
-            responses_urls = await asyncio.gather(*tasks)
+            self._init_session()
+            retry_client = self.__retry_client
+            return await asyncio.gather(*tasks)
         finally:
-            if self.client_session:
-                await self.client_session.close()
-            await self.__retry_client.close()
-
-        return responses_urls
+            # gather does not cancel sibling requests when one request fails.
+            # Settle them before releasing resources or allowing another run.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                if self.client_session is not None:
+                    await self.client_session.close()
+                if retry_client is not None:
+                    await retry_client.close()
+            finally:
+                if owns_session:
+                    self.client_session = None
+                if owns_connector and self.connector is not None:
+                    try:
+                        await self.connector.close()
+                    finally:
+                        self.connector = None
 
     def _init_session(self) -> None:
         """
