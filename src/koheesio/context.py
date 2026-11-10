@@ -260,28 +260,38 @@ class Context(Mapping):
         return cls.from_dict(toml_dict)
 
     @classmethod
-    def from_yaml(cls, yaml_file_or_str: str) -> Context:
-        """Creates Context object from a given yaml file
+    def from_yaml(cls, yaml_file_or_str: Union[str, Path]) -> Context:
+        """Create a Context from a YAML mapping using PyYAML's safe loader.
+
+        Python-object constructors are not enabled. Unsupported tags raise when resolved;
+        tags on discarded merge nodes may be ignored. The document must have a mapping
+        at its root; nested mappings, lists, and scalar values are supported.
 
         Parameters
         ----------
         yaml_file_or_str: str or Path
-            Pathlike string or Path that points to the yaml file, or string containing yaml
+            An existing file path or YAML text. A nonexistent path is parsed as text.
 
         Returns
         -------
         Context
+
+        Raises
+        ------
+        yaml.YAMLError
+            If the YAML is malformed or resolves an unsupported tag.
+        ValueError
+            If the document root is not a mapping, including empty or null documents.
         """
-        yaml_str = yaml_file_or_str
+        yaml_str = str(yaml_file_or_str)
 
-        # check if yaml_str is pathlike
-        if (yaml_file := Path(yaml_file_or_str)).exists():
+        # Check if the input names an existing file; an empty string is YAML text.
+        if yaml_str and (yaml_file := Path(yaml_str)).exists():
             yaml_str = yaml_file.read_text(encoding="utf-8")
-        else:
-            yaml_str = str(yaml_file_or_str)
 
-        # Bandit: disable yaml.load warning
-        yaml_dict = yaml.load(yaml_str, Loader=yaml.Loader)  # nosec B506: yaml_load
+        yaml_dict = yaml.safe_load(yaml_str)
+        if not isinstance(yaml_dict, dict):
+            raise ValueError("YAML document must contain a mapping at the root.")
 
         return cls.from_dict(yaml_dict)
 

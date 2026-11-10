@@ -1,10 +1,13 @@
-from textwrap import dedent
+import json
+from textwrap import dedent, indent
 
 import pytest
+from yaml.constructor import ConstructorError
 
 from pydantic import SecretStr
 
 from koheesio.context import Context
+from koheesio.models import BaseModel
 from koheesio.utils import get_project_root
 
 test_dict = dict(foo="bar", nested=dict(bar="baz"), listed=["first_item", dict(deeply_nested="lorem ipsum")])
@@ -300,35 +303,77 @@ def test_from_yaml(yaml_path_or_str):
     assert actual["foo"] == "bar"
 
 
-def test_from_yaml_path_object_nonexistent_file():
-    """Test that from_yaml handles Path objects for non-existent files gracefully.
-
-    This test verifies the fix for bug #226: When a Path object pointing to a non-existent
-    file is passed to from_yaml(), it should not raise AttributeError about 'read'.
-
-    After the fix, yaml.load() treats the stringified path as YAML content, which returns
-    a string. Context.__init__ then ignores non-dict/non-Context arguments, resulting in
-    an empty Context. This is acceptable behavior - the critical fix is preventing the
-    confusing AttributeError: 'PosixPath' object has no attribute 'read'.
-    """
-    from pathlib import Path
-
-    nonexistent_path = Path("/tmp/nonexistent_file_for_testing_12345.yaml")
-
-    # Ensure the file doesn't exist
+@pytest.mark.parametrize("factory", [Context, BaseModel])
+@pytest.mark.parametrize("as_string", [False, True])
+def test_from_yaml_path_object_nonexistent_file(factory, as_string, tmp_path):
+    """Missing paths are parsed as text and rejected by the mapping-root policy."""
+    nonexistent_path = tmp_path / "missing.yaml"
     assert not nonexistent_path.exists()
+    source = str(nonexistent_path) if as_string else nonexistent_path
 
-    # This should not raise the AttributeError about 'read' that was in bug #226
-    # It may return an empty Context or raise a different error, but not the original bug
+    with pytest.raises(ValueError, match="YAML document must contain a mapping at the root"):
+        factory.from_yaml(source)
+
+
+@pytest.mark.parametrize("factory", [Context, BaseModel])
+@pytest.mark.parametrize("source_kind", ["text", "path", "path_string"])
+def test_from_yaml_nested_configuration(factory, source_kind, tmp_path):
+    payload = "database: {host: localhost, port: 5432}\noptions: [true, 3, null, {label: café}]\n"
+    source = payload
+    if source_kind != "text":
+        source = tmp_path / "configuration.yaml"
+        source.write_text(payload, encoding="utf-8")
+        if source_kind == "path_string":
+            source = str(source)
+
+    actual = factory.from_yaml(source).to_dict()
+    assert actual["database"] == {"host": "localhost", "port": 5432}
+    assert actual["options"] == [True, 3, None, {"label": "café"}]
+
+
+@pytest.mark.parametrize("factory", [Context, BaseModel])
+@pytest.mark.parametrize("payload", ["", " \n", "null", "false", "42", "'value'", "[]", "- key: value"])
+def test_from_yaml_requires_mapping_root(factory, payload):
+    with pytest.raises(ValueError, match="YAML document must contain a mapping at the root"):
+        factory.from_yaml(payload)
+
+
+@pytest.mark.parametrize("factory", [Context, BaseModel])
+def test_from_yaml_empty_mapping(factory):
+    actual = factory.from_yaml("{}")
+    assert isinstance(actual, factory)
+    if factory is Context:
+        assert actual.to_dict() == {}
+
+
+@pytest.mark.parametrize("factory", [Context, BaseModel])
+@pytest.mark.parametrize("source_kind", ["text", "path", "path_string"])
+@pytest.mark.parametrize("constructor", ["apply", "new"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_from_yaml_rejects_executable_tags_before_side_effects(
+    factory, source_kind, constructor, nested, tmp_path, monkeypatch
+):
+    """Neither entrypoint may run a YAML constructor, even inside a mapping."""
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "yaml-loader-marker.txt"
+    expression = "__import__('pathlib').Path('yaml-loader-marker.txt').write_text('YAML_LOADER_EXECUTED')"
+    payload = f"!!python/object/{constructor}:builtins.eval\n- {json.dumps(expression)}\n"
+    if nested:
+        payload = "config:\n" + indent(payload, "  ")
+
+    source = payload
+    if source_kind != "text":
+        source = tmp_path / "configuration.yaml"
+        source.write_text(payload, encoding="utf-8")
+        if source_kind == "path_string":
+            source = str(source)
+
+    assert not marker.exists()
     try:
-        result = Context.from_yaml(nonexistent_path)
-        # If it succeeds, it should return a Context (likely empty)
-        assert isinstance(result, Context)
-    except AttributeError as e:
-        # If it raises AttributeError, it should NOT be about 'read'
-        assert "'read'" not in str(
-            e
-        ), f"Bug #226: from_yaml() should not raise AttributeError about 'read' when passed a Path object. Got: {e}"
+        with pytest.raises(ConstructorError):
+            factory.from_yaml(source)
+    finally:
+        assert not marker.exists(), "YAML parsing executed a Python constructor"
 
 
 def test_to_yaml():
@@ -359,22 +404,27 @@ def test_to_json():
 
 
 def test_yaml_json_roundtrip():
-    """Test that to_yaml and to_json are inverse operations"""
-    # given an input that is not JSON serializable by standard library
-    inp_data: dict = {"attr": SecretStr("val")}
-    context = Context(inp_data)
+    """Ordinary configuration data still round-trips through YAML and JSON."""
+    context = Context({"nested": {"items": [1, True, None, "value"]}})
 
-    # generate json and yaml strings
-    j = context.to_json()
-    y = context.to_yaml()
+    j_context = Context.from_json(context.to_json())
+    y_context = Context.from_yaml(context.to_yaml())
 
-    # convert back to Context objects
-    j_context = Context.from_json(j)
-    y_context = Context.from_yaml(y)
+    assert j_context.to_dict() == y_context.to_dict() == context.to_dict()
 
-    # check that the resulting Context objects are equal (roundtrip)
-    assert j_context.to_yaml() == y_context.to_yaml()
-    assert j_context.to_json() == y_context.to_json()
+
+@pytest.mark.parametrize("factory", [Context, BaseModel])
+def test_from_yaml_rejects_python_object_exports(factory):
+    """YAML exports keep their existing format, but object tags cannot be reloaded."""
+    context = Context({"attr": SecretStr("synthetic-secret")})
+    exported_yaml = context.to_yaml()
+    assert "!!python/object:pydantic.types.SecretStr" in exported_yaml
+
+    with pytest.raises(ConstructorError):
+        factory.from_yaml(exported_yaml)
+
+    restored = Context.from_json(context.to_json())
+    assert restored.attr.get_secret_value() == "synthetic-secret"
 
 
 def test_from_toml():

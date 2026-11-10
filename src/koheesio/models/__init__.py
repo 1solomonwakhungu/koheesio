@@ -432,10 +432,13 @@ class BaseModel(PydanticBaseModel, ABC):  # type: ignore[no-redef]
         return cls.from_context(_context)
 
     @classmethod
-    def from_yaml(cls, yaml_file_or_str: str) -> BaseModel:
-        """Creates BaseModel object from a given yaml file
+    def from_yaml(cls, yaml_file_or_str: Union[str, Path]) -> BaseModel:
+        """Create a BaseModel from a YAML mapping.
 
-        Note: BaseModel offloads the serialization and deserialization of the YAML string to Context class.
+        Delegates to Context.from_yaml, which uses PyYAML's safe loader without Python-object constructors.
+        Unsupported tags raise when resolved; tags on discarded merge nodes may be ignored.
+        Empty, null, scalar, and sequence roots raise ValueError. Existing paths are read as files;
+        nonexistent paths are parsed as YAML text and must also contain a mapping.
 
         Parameters
         ----------
