@@ -39,6 +39,7 @@ class TestFileWriteMode:
             (FileWriteMode.OVERWRITE, "wb"),
             (FileWriteMode.BACKUP, "wb"),
             (FileWriteMode.EXCLUSIVE, "wb"),
+            (FileWriteMode.IGNORE, "wb"),
             (FileWriteMode.APPEND, "ab"),
         ],
     )
@@ -142,12 +143,37 @@ class TestDownloadFileStep:
             # Act
             step = DownloadFileStep(url=URL, download_path=download_path, mode="ignore")
             step.log.setLevel("INFO")
-            step.execute()
+            output = step.execute()
 
         # Assert
         assert "Ignoring testfile.txt based on IGNORE mode." in caplog.text
         assert downloaded_file.exists()
         assert downloaded_file.read_bytes() == b"foo"
+        assert output.download_file_path == downloaded_file
+        assert mocker.call_count == 0
+
+    def test_download_file_step_ignore_mode_missing_file(self, download_path: Path) -> None:
+        """IGNORE creates a missing file and skips the next download once it exists."""
+        destination = download_path / "testfile.txt"
+        payload = b"\x00\xfffirst chunk\nsecond chunk\n"
+        step = DownloadFileStep(url=URL, download_path=download_path, mode="ignore", chunk_size=16)
+        assert not destination.exists()
+
+        with Mocker() as mocker:
+            mocker.get(URL, content=payload)
+
+            output = step.execute()
+
+            assert output.download_file_path == destination
+            assert destination.read_bytes() == payload
+            assert mocker.call_count == 1
+
+            mocker.get(URL, content=b"replacement")
+            output = step.execute()
+
+            assert output.download_file_path == destination
+            assert destination.read_bytes() == payload
+            assert mocker.call_count == 1
 
     def test_download_file_step_exclusive_mode(self, download_path: Path, downloaded_file: Any) -> None:
         """In EXCLUSIVE mode, an error should be raised if the file exists"""
