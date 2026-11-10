@@ -2,8 +2,10 @@ from typing import List, Type
 
 import pytest
 from requests import HTTPError
-from requests.exceptions import RetryError
+from requests.exceptions import JSONDecodeError, RetryError
 import responses
+from responses import matchers
+from responses.registries import OrderedRegistry
 
 from pydantic import ValidationError
 
@@ -16,6 +18,7 @@ from koheesio.steps.http import (
     HttpPostStep,
     HttpPutStep,
     HttpStep,
+    PaginatedHttpGetStep,
 )
 
 BASE_URL = "https://42.koheesio.test"
@@ -69,7 +72,7 @@ log = LoggingFactory.get_logger(name="test_http", inherit_from_koheesio=True)
             DELETE_ENDPOINT,
             HttpDeleteStep,
             "delete",
-            {"detail": "Deleted"},
+            None,
             204,
             id="httpDeleteStep_success",
         ),
@@ -213,3 +216,92 @@ def test_max_retries(
         step.execute()
 
     assert request_count == expected_count
+
+
+@responses.activate
+@pytest.mark.parametrize("payload", [[{"id": 1}], {"id": 1}])
+def test_paginated_http_get_without_pagination(payload):
+    responses.get(
+        GET_ENDPOINT,
+        json=payload,
+        match=[matchers.request_kwargs_matcher({"timeout": 7})],
+    )
+    step = PaginatedHttpGetStep(url=GET_ENDPOINT, headers={"X-Test": "pagination"}, timeout=7)
+
+    result = step.execute()
+
+    assert result.response_json == [{"id": 1}]
+    assert len(responses.calls) == 1
+    assert responses.calls[0].request.url == GET_ENDPOINT
+    assert responses.calls[0].request.headers["X-Test"] == "pagination"
+    assert step.url == GET_ENDPOINT
+    assert result.response_raw is None
+    assert result.raw_payload is None
+    assert result.status_code is None
+
+
+@responses.activate(registry=OrderedRegistry)
+@pytest.mark.parametrize("offset", [1, 3])
+@pytest.mark.parametrize("array_payload", [False, True])
+def test_paginated_http_get_page_count(offset, array_payload):
+    template = f"{GET_ENDPOINT}?page={{page}}&limit={{limit}}&offset={{offset}}"
+    expected_urls = [f"{GET_ENDPOINT}?page={page}&limit=10&offset={offset}" for page in range(offset, offset + 2)]
+    expected_data = [{"page": page} for page in range(offset, offset + 2)]
+    for url, payload in zip(expected_urls, expected_data):
+        responses.get(
+            url,
+            json=[payload] if array_payload else payload,
+            match=[matchers.request_kwargs_matcher({"timeout": 7})],
+        )
+    step = PaginatedHttpGetStep(
+        url=template,
+        paginate=True,
+        pages=2,
+        offset=offset,
+        limit=10,
+        headers={"X-Test": "pagination"},
+        timeout=7,
+    )
+
+    result = step.execute()
+
+    assert [call.request.url for call in responses.calls] == expected_urls
+    assert result.response_json == expected_data
+    assert all(call.request.headers["X-Test"] == "pagination" for call in responses.calls)
+    assert step.url == template
+
+
+@responses.activate(registry=OrderedRegistry)
+@pytest.mark.parametrize("failure", ["http", "json"])
+def test_paginated_http_get_restores_url_after_failure(failure):
+    template = f"{GET_ENDPOINT}?page={{page}}"
+    responses.get(f"{GET_ENDPOINT}?page=1", json=[{"page": 1}])
+    if failure == "http":
+        responses.get(f"{GET_ENDPOINT}?page=2", status=500)
+        expected_error = HTTPError
+    else:
+        responses.get(f"{GET_ENDPOINT}?page=2", body="invalid JSON", content_type="application/json")
+        expected_error = JSONDecodeError
+    step = PaginatedHttpGetStep(url=template, paginate=True, pages=2, max_retries=0)
+
+    with pytest.raises(expected_error):
+        step.execute()
+
+    assert step.url == template
+    assert [call.request.url for call in responses.calls] == [
+        f"{GET_ENDPOINT}?page=1",
+        f"{GET_ENDPOINT}?page=2",
+    ]
+
+    responses.reset()
+    for page in (1, 2):
+        responses.get(f"{GET_ENDPOINT}?page={page}", json=[{"page": page}])
+
+    result = step.execute()
+
+    assert result.response_json == [{"page": 1}, {"page": 2}]
+    assert [call.request.url for call in responses.calls] == [
+        f"{GET_ENDPOINT}?page=1",
+        f"{GET_ENDPOINT}?page=2",
+    ]
+    assert step.url == template
