@@ -1,5 +1,5 @@
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 from delta.tables import DeltaMergeBuilder
 import pytest
@@ -102,6 +102,121 @@ def test_delta_table_merge_all(spark):
             for row in spark.read.table(table_name).collect()
         }
         assert result == expected
+
+
+@pytest.mark.parametrize(
+    "case_id,target_alias,source_alias,expected_target,expected_source",
+    [
+        ("default", None, None, "target", "source"),
+        ("custom_source", None, "incoming", "target", "incoming"),
+        ("custom_target", "existing", None, "existing", "source"),
+        ("custom_both", "existing", "incoming", "existing", "incoming"),
+    ],
+)
+def test_delta_table_merge_all_aliases(spark, case_id, target_alias, source_alias, expected_target, expected_source):
+    from koheesio.spark.utils.connect import is_remote_session
+
+    table_name = f"test_merge_all_aliases_{case_id}"
+    target_df = spark.createDataFrame(
+        [
+            {"id": 1, "value": "no_merge"},
+            {"id": 2, "value": "expected_merge"},
+            {"id": 5, "value": "xxxx"},
+        ]
+    )
+    source_df = spark.createDataFrame(
+        [
+            {"id": 2, "value": "updated_value_long"},
+            {"id": 3, "value": None},
+            {"id": 4, "value": "new_value"},
+            {"id": 5, "value": "x"},
+        ]
+    )
+    expected = {
+        1: "no_merge",
+        2: "updated_value_long",
+        4: "new_value",
+        5: "xxxx",
+    }
+
+    output_mode_params = {
+        "merge_cond": f"{expected_target}.id = {expected_source}.id",
+        "update_cond": F.expr(f"length({expected_source}.value) > length({expected_target}.value)"),
+        "insert_cond": F.expr(f"{expected_source}.value IS NOT NULL"),
+    }
+    if target_alias is not None:
+        output_mode_params["target_alias"] = target_alias
+    if source_alias is not None:
+        output_mode_params["source_alias"] = source_alias
+
+    DeltaTableWriter(table=table_name, output_mode=BatchOutputMode.OVERWRITE, df=target_df).execute()
+    merge_writer = DeltaTableWriter(
+        table=table_name,
+        output_mode=BatchOutputMode.MERGE_ALL,
+        output_mode_params=output_mode_params,
+        df=source_df,
+    )
+
+    if 3.4 < SPARK_MINOR_VERSION < 4.0 and is_remote_session():
+        with pytest.raises(SparkConnectDeltaTableException) as exc_info:
+            merge_writer.execute()
+
+        assert str(exc_info.value).startswith("`DeltaTable.forName` is not supported due to delta calling _sc")
+    else:
+        merge_writer.execute()
+        result = {row["id"]: row["value"] for row in spark.read.table(table_name).collect()}
+        assert result == expected
+
+
+@pytest.mark.parametrize(
+    "output_mode_params,expected_target,expected_source",
+    [
+        ({"merge_cond": "target.id = source.id"}, "target", "source"),
+        ({"merge_cond": "target.id = src.id", "source_alias": "src"}, "target", "src"),
+        ({"merge_cond": "tgt.id = source.id", "target_alias": "tgt"}, "tgt", "source"),
+        (
+            {"merge_cond": "tgt.id = src.id", "target_alias": "tgt", "source_alias": "src"},
+            "tgt",
+            "src",
+        ),
+    ],
+)
+def test_delta_table_merge_all_passes_expected_aliases(dummy_df, output_mode_params, expected_target, expected_source):
+    mock_source_df = MagicMock(spec=type(dummy_df))
+    aliased_source_df = MagicMock(spec=type(dummy_df))
+    mock_source_df.alias.return_value = aliased_source_df
+
+    mock_delta_table = MagicMock()
+    mock_merge_builder = MagicMock()
+    mock_delta_table.alias.return_value = mock_delta_table
+    mock_delta_table.merge.return_value = mock_merge_builder
+    mock_merge_builder.whenMatchedUpdateAll.return_value = mock_merge_builder
+    mock_merge_builder.whenNotMatchedInsertAll.return_value = mock_merge_builder
+
+    table = DeltaTableStep(table="mock_merge_all_aliases_table")
+    merge_writer = DeltaTableWriter(
+        table=table,
+        output_mode=BatchOutputMode.MERGE_ALL,
+        output_mode_params=output_mode_params,
+        df=mock_source_df,
+    )
+
+    with (
+        patch.object(DeltaTableStep, "exists", new_callable=PropertyMock, return_value=True),
+        patch(
+            "koheesio.spark.writers.delta.batch.get_delta_table_for_name",
+            return_value=mock_delta_table,
+        ),
+    ):
+        builder = merge_writer.writer
+
+    assert builder is mock_merge_builder
+    mock_delta_table.alias.assert_called_once_with(expected_target)
+    mock_source_df.alias.assert_called_once_with(expected_source)
+    mock_delta_table.merge.assert_called_once_with(
+        source=aliased_source_df,
+        condition=output_mode_params["merge_cond"],
+    )
 
 
 def test_deltatablewriter_with_invalid_conditions(spark, dummy_df):
